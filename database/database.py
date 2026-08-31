@@ -19,7 +19,7 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        with self.connect() as conn:
+        def build_schema(conn: sqlite3.Connection) -> None:
             conn.executescript("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY,
@@ -46,6 +46,16 @@ class Database:
                     conn.execute("INSERT INTO products (product_name, created_at) VALUES (?, ?)", (product_name, datetime.now().isoformat(timespec="seconds")))
 
             conn.execute("UPDATE comparisons SET product_id = (SELECT id FROM products WHERE products.product_name = comparisons.product_name) WHERE product_id IS NULL AND product_name IS NOT NULL")
+
+        try:
+            with self.connect() as conn:
+                build_schema(conn)
+        except sqlite3.DatabaseError:
+            if self.path.exists():
+                backup = self.path.with_suffix(f"{self.path.suffix}.corrupt-{datetime.now():%Y%m%d%H%M%S}")
+                self.path.replace(backup)
+            with self.connect() as conn:
+                build_schema(conn)
 
     def _save_model(self, conn: sqlite3.Connection, path: Path, classes: list[str]) -> int:
         now = datetime.now().isoformat(timespec="seconds")
