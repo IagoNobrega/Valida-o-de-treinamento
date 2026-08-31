@@ -80,16 +80,41 @@ def summarize_wins(selected: list[str], old_curve: pd.DataFrame, new_curve: pd.D
     return wins
 
 
-def render_learning_curves(old_run: TrainingArtifact, new_run: TrainingArtifact) -> None:
+def persist_curve_result(old_run: TrainingArtifact, new_run: TrainingArtifact, product_name: str, status: str) -> None:
+    payload = {
+        "comparison_id": comparison_id(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "product_name": (product_name or "Produto sem nome").strip() or "Produto sem nome",
+        "old_model": str(old_run.best_weights),
+        "new_model": str(new_run.best_weights),
+        "old_classes": [],
+        "new_classes": [],
+        "config": {"data": str(old_run.dataset_yaml or ""), "split": "test", "conf": 0.25, "iou": 0.50, "imgsz": 640, "device": "cpu"},
+        "status": status,
+        "recommendation": {"winner": "candidato" if status == "MELHOR" else "referência", "message": f"Comparação por curvas: {status}"},
+        "metrics": {
+            "old": {key: None for key in ("precision", "recall", "map50", "map50_95", "preprocess_ms", "inference_ms", "postprocess_ms")},
+            "new": {key: None for key in ("precision", "recall", "map50", "map50_95", "preprocess_ms", "inference_ms", "postprocess_ms")},
+        },
+        "class_metrics": {"old": [], "new": []},
+        "comparison_rows": [],
+        "class_comparison_rows": [],
+    }
+    DB.save_comparison(payload)
+
+
+def render_learning_curves(old_run: TrainingArtifact, new_run: TrainingArtifact, product_name: str = "") -> dict[str, int]:
     old_curve, new_curve = read_learning_curve(old_run), read_learning_curve(new_run)
     available = metric_columns(old_curve, new_curve)
     if not available:
         st.warning("Não existem métricas numéricas em comum nos dois arquivos results.csv.")
-        return
+        return {REFERENCE_NAME: 0, CANDIDATE_NAME: 0}
     preferred = [column for column in available if any(token in column.lower() for token in ("map", "precision", "recall", "loss", "fitness"))]
     selected = st.multiselect("Curvas exibidas", available, default=preferred or available[:1], key="curve_metrics")
     if not selected:
-        return
+        return {REFERENCE_NAME: 0, CANDIDATE_NAME: 0}
+    if product_name:
+        st.subheader(f"Produto: {product_name}")
 
     wins = summarize_wins(selected, old_curve, new_curve)
 
@@ -139,6 +164,7 @@ def render_learning_curves(old_run: TrainingArtifact, new_run: TrainingArtifact)
         rows.append({"Métrica": metric, f"{REFERENCE_LABEL} (última época)": old_value, f"{CANDIDATE_LABEL} (última época)": new_value, "Δ": new_value - old_value})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     st.caption("Esta comparação descreve o histórico de treinamento. A aprovação técnica do candidato exige a validação dos dois modelos no mesmo dataset.")
+    return wins
 
 
 def render_training_info(title: str, artifact: TrainingArtifact) -> None:
@@ -157,8 +183,10 @@ def curve_analysis_page() -> None:
     with st.form("learning_curves"):
         old_folder = st.text_input("Pasta do treinamento de referência", placeholder=r"C:\caminho\treino_antigo")
         new_folder = st.text_input("Pasta do treinamento candidato", placeholder=r"C:\caminho\treino_novo")
-        submitted = st.form_submit_button("Comparar curvas", type="primary")
-    if not submitted:
+        product_name = st.text_input("Nome do produto", placeholder="Ex.: Produto X")
+        compare_clicked = st.form_submit_button("Comparar curvas", type="primary")
+        save_clicked = st.form_submit_button("Salvar no histórico", type="secondary")
+    if not compare_clicked and not save_clicked:
         return
     try:
         old_run, new_run = inspect_training_folder(Path(old_folder)), inspect_training_folder(Path(new_folder))
@@ -167,7 +195,17 @@ def curve_analysis_page() -> None:
             render_training_info("Treinamento de referência", old_run)
         with second:
             render_training_info("Treinamento candidato", new_run)
-        render_learning_curves(old_run, new_run)
+        wins = render_learning_curves(old_run, new_run, product_name.strip())
+        normalized = (product_name or "").strip() or "Produto sem nome"
+        if wins[REFERENCE_NAME] == wins[CANDIDATE_NAME]:
+            status = "EMPATE"
+        else:
+            status = "MELHOR" if wins[CANDIDATE_NAME] > wins[REFERENCE_NAME] else "REFERÊNCIA"
+        if save_clicked:
+            persist_curve_result(old_run, new_run, normalized, status)
+            st.success(f"Comparação salva no histórico com o produto: {normalized}")
+        elif compare_clicked:
+            st.caption(f"Status da comparação: {status}")
     except ValidationError as exc:
         st.error(str(exc))
     except Exception:
@@ -175,12 +213,13 @@ def curve_analysis_page() -> None:
         st.error("Não foi possível analisar as curvas. Consulte logs/app.log.")
 
 
-def persist_result(cid: str, prepared, old_run: TrainingArtifact, new_run: TrainingArtifact, old_metrics: Metrics, new_metrics: Metrics, old_classes: list[ClassMetric], new_classes: list[ClassMetric], rows: list[dict], class_rows: list[dict], status: str, recommendation: dict) -> None:
+def persist_result(cid: str, prepared, old_run: TrainingArtifact, new_run: TrainingArtifact, old_metrics: Metrics, new_metrics: Metrics, old_classes: list[ClassMetric], new_classes: list[ClassMetric], rows: list[dict], class_rows: list[dict], status: str, recommendation: dict, product_name: str = "Produto sem nome") -> None:
     directory = RESULTS / cid
     (directory / "old").mkdir(parents=True, exist_ok=True)
     (directory / "new").mkdir(parents=True, exist_ok=True)
     payload = {
         "comparison_id": cid, "created_at": datetime.now().isoformat(timespec="seconds"),
+        "product_name": (product_name or "Produto sem nome").strip() or "Produto sem nome",
         "old_model": str(prepared.old_model.path), "new_model": str(prepared.new_model.path),
         "old_classes": prepared.old_model.names, "new_classes": prepared.new_model.names,
         "dataset_classes": prepared.dataset_classes, "config": prepared.config.as_dict(), "status": status,
@@ -218,6 +257,7 @@ def validation_page() -> None:
     st.subheader("Validação técnica no mesmo dataset")
     st.caption("Usa automaticamente weights/best.pt de cada pasta e aplica a mesma configuração aos dois modelos.")
     with st.form("validation"):
+        product_name = st.text_input("Nome do produto", key="product_name_validation", placeholder="Ex.: Produto X")
         old_folder = st.text_input("Pasta de referência", key="validation_old")
         new_folder = st.text_input("Pasta candidata", key="validation_new")
         data_yaml = st.text_input("data.yaml de validação")
@@ -243,7 +283,7 @@ def validation_page() -> None:
             rows, class_rows = compare_models(old_metrics, new_metrics), compare_class_metrics(old_classes, new_classes)
             status = evaluate_candidate(old_metrics, new_metrics, class_rows)
             recommendation = recommend_training(old_metrics, new_metrics, class_rows)
-            persist_result(cid, prepared, old_run, new_run, old_metrics, new_metrics, old_classes, new_classes, rows, class_rows, status, recommendation)
+            persist_result(cid, prepared, old_run, new_run, old_metrics, new_metrics, old_classes, new_classes, rows, class_rows, status, recommendation, product_name)
             progress.update(label="Validação concluída", state="complete")
         render_metrics(old_metrics, new_metrics, rows, class_rows, status, recommendation)
     except ModelCompatibilityError as exc:
@@ -257,11 +297,17 @@ def validation_page() -> None:
 
 
 def history_page() -> None:
-    records = DB.list_comparisons()
+    products = [item["product_name"] for item in DB.list_products()]
+    selected_product = st.selectbox("Filtrar por produto", ["Todos"] + products, index=0)
+    status_filter = st.selectbox("Filtrar por status", ["Todos", "MELHOR", "REFERÊNCIA", "EMPATE"])
+    records = DB.list_comparisons(product_name=selected_product if selected_product != "Todos" else None, result_status=status_filter if status_filter != "Todos" else None)
     if not records:
-        st.info("Ainda não há comparações técnicas salvas.")
+        st.info("Ainda não há comparações técnicas salvas para esse filtro.")
         return
-    st.dataframe(pd.DataFrame(records), hide_index=True, width="stretch")
+    dataframe = pd.DataFrame(records)
+    if "product_name" in dataframe.columns:
+        dataframe = dataframe[["product_name", "id", "created_at", "old_model", "new_model", "dataset_name", "result_status"]]
+    st.dataframe(dataframe, hide_index=True, width="stretch")
 
 
 st.set_page_config(page_title="YOLO Training Analytics", layout="wide")
